@@ -1,9 +1,9 @@
 # reswizz
 
 A small native Windows dashboard in the style of btop. It is written in Rust with egui.
-One page shows CPU (total and per core), memory, disk, network, processes, and open TCP/UDP endpoints.
+One page shows CPU (total and per core), memory, GPU, disk, network, processes, and open TCP/UDP endpoints.
 A built-in **profiler** ranks programs by how much load they caused since start: CPU time, average and
-peak CPU, peak memory, and total I/O, all grouped by program name, plus **real per-process network bytes**. It keeps recording while the window is minimized.
+peak CPU, peak memory, average and peak GPU, peak GPU memory, and total I/O, all grouped by program name, plus **real per-process network bytes**. It keeps recording while the window is minimized.
 Select any process to **inspect** it. You get the user/kernel CPU split, threads, handles, private memory, page faults,
 the I/O breakdown, the services it hosts (useful for svchost), its parent and children, 60 s graphs, and
 **findings**: plain-language hints about why the process is busy.
@@ -52,3 +52,8 @@ GitHub Actions run on every pull request and on `main`:
   parent PID may show as `n/a`. Run it as Administrator to see more.
 - **The profile lives in memory only.** It is lost when you close the app.
 - **Thread count is not shown**, because `sysinfo` does not report it on Windows.
+- **GPU %** is the busiest engine (3D, copy, video…), as in Task Manager. **GPU memory** is dedicated plus shared,
+  so integrated GPUs show real numbers. It comes from Windows performance counters and needs no admin rights.
+- **There is no fan speed.** Windows does not expose fan RPM on most machines without a kernel driver. Instead, the
+  cpu box shows actual CPU speed as % of base and flags **throttled** when a thermal zone limits the CPU, or when
+  speed drops under heavy load.

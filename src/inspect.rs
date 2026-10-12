@@ -68,6 +68,7 @@ pub fn findings(
     threads: Option<u32>,
     mem_growth: Option<f64>,
     net: Option<(f64, f64)>,
+    gpu: f32,
 ) -> Vec<String> {
     let mut f = Vec::new();
     if let (Some(k), Some(u)) = (i.kernel_pct, i.user_pct)
@@ -136,6 +137,11 @@ pub fn findings(
             } else {
                 "mostly downloading"
             }
+        ));
+    }
+    if gpu > 30.0 {
+        f.push(format!(
+            "keeping a GPU engine {gpu:.0}% busy: rendering, video encode/decode or GPU compute"
         ));
     }
     if !i.services.is_empty() {
@@ -365,9 +371,11 @@ mod tests {
             services: vec!["wuauserv".into()],
             ..Default::default()
         };
-        let f = findings(&i, 35.0, Some(20), None, None);
+        let f = findings(&i, 35.0, Some(20), None, None, 0.0);
         assert!(f[0].contains("kernel time"));
         assert!(f.last().unwrap().contains("wuauserv"));
-        assert!(findings(&Inspect::default(), 0.0, None, None, None).is_empty());
+        let f = findings(&Inspect::default(), 0.0, None, None, None, 80.0);
+        assert!(f[0].contains("GPU engine 80% busy"));
+        assert!(findings(&Inspect::default(), 0.0, None, None, None, 0.0).is_empty());
     }
 }

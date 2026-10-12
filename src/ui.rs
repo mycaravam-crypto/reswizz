@@ -20,6 +20,7 @@ const C_CPU: Color32 = Color32::from_rgb(0x7f, 0xc8, 0x8f);
 const C_MEM: Color32 = Color32::from_rgb(0xe0, 0xb0, 0x6a);
 const C_DISK: Color32 = Color32::from_rgb(0xe0, 0x7f, 0x86);
 const C_NET: Color32 = Color32::from_rgb(0xb3, 0x8f, 0xe8);
+const C_GPU: Color32 = Color32::from_rgb(0x6a, 0xd0, 0xc8);
 const C_PROC: Color32 = Color32::from_rgb(0x6f, 0xb6, 0xe0);
 const LOW: Color32 = Color32::from_rgb(0x50, 0xd0, 0x80);
 const MID: Color32 = Color32::from_rgb(0xf0, 0xd0, 0x60);
@@ -98,6 +99,17 @@ fn cpu_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                     .strong(),
             );
             ui.label(RichText::new(format!("{} threads", s.cores.len())).color(MUTED));
+            if let Some(v) = s.cpu_speed {
+                let hover = "actual speed vs base clock (>100% = turbo)";
+                match &s.throttle {
+                    Some(why) => ui
+                        .label(RichText::new(format!("{v:.0}% speed · throttled")).color(HIGH))
+                        .on_hover_text(format!("{why}\n{hover}")),
+                    None => ui
+                        .label(RichText::new(format!("{v:.0}% speed")).color(MUTED))
+                        .on_hover_text(hover),
+                };
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut ms = app.interval_ms.load(std::sync::atomic::Ordering::Relaxed);
                 ui.add(egui::Slider::new(&mut ms, MIN_INTERVAL_MS..=MAX_INTERVAL_MS).suffix("ms"));
@@ -146,7 +158,7 @@ fn cpu_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
 fn side_column(app: &mut App, ui: &mut Ui, s: &Snapshot) {
     let h = ui.available_height();
     let w = ui.available_width();
-    ui.allocate_ui(vec2(w, h * 0.36), |ui| {
+    ui.allocate_ui(vec2(w, h * 0.3), |ui| {
         boxed(ui, "mem", C_MEM, |ui| {
             let mw = ui.available_width() - 190.0;
             let free = s.mem_total.saturating_sub(s.mem_used);
@@ -171,7 +183,27 @@ fn side_column(app: &mut App, ui: &mut Ui, s: &Snapshot) {
         });
     });
     ui.add_space(10.0);
-    ui.allocate_ui(vec2(w, h * 0.28), |ui| {
+    ui.allocate_ui(vec2(w, h * 0.18), |ui| {
+        boxed(ui, "gpu", C_GPU, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(e) = &s.gpu_err {
+                    ui.label(RichText::new("n/a").color(MUTED)).on_hover_text(e);
+                    return;
+                }
+                ui.label(
+                    RichText::new(format!("{:5.1}%", s.gpu))
+                        .color(heat(s.gpu / 100.0))
+                        .strong(),
+                )
+                .on_hover_text("busiest GPU engine (3D, copy, video…), like Task Manager");
+                ui.label(RichText::new(format!("mem {}", bytes(s.gpu_mem as f64))).color(MUTED));
+            });
+            let sz = ui.available_size();
+            graph(ui, &app.hist.gpu, 100.0, sz, None);
+        });
+    });
+    ui.add_space(10.0);
+    ui.allocate_ui(vec2(w, h * 0.22), |ui| {
         boxed(ui, "disk", C_DISK, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("▲ read  {}", rate(s.disk_read))).color(C_DISK));
@@ -254,6 +286,7 @@ fn profile_controls(app: &mut App, ui: &mut Ui, s: &Snapshot) {
         "Profile accumulates since start (or reset), grouped by program name.\n\
          cpu time = core-seconds used · avg = share of the whole machine over the recording\n\
          peak = highest sample (all instances summed) · keeps recording while minimized.\n\
+         gpu = busiest GPU engine per process (instances summed) · gpu mem = dedicated + shared GPU memory.\n\
          net = real bytes sent/received per process (kernel ETW trace, needs admin).\n\
          Click a row to filter the process list by that program.",
     );
@@ -297,6 +330,7 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                 p.pid.to_string(),
                 p.name.clone(),
                 format!("{:5.1}", p.cpu),
+                format!("{:5.1}", p.gpu),
                 bytes(p.mem as f64),
                 rate(p.io),
                 p.net.map_or("n/a".into(), |(tx, rx)| rate(tx + rx)),
@@ -307,6 +341,7 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                 Some(p.pid as f64),
                 None,
                 Some(p.cpu as f64),
+                Some(p.gpu as f64),
                 Some(p.mem as f64),
                 Some(p.io),
                 Some(p.net.map_or(-1.0, |(tx, rx)| tx + rx)),
@@ -323,6 +358,7 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
         ("pid", 64.0),
         ("program", 190.0),
         ("cpu%", 110.0),
+        ("gpu%", 56.0),
         ("mem", 84.0),
         ("i/o", 96.0),
         ("net", 96.0),
@@ -366,6 +402,9 @@ fn profile(app: &mut App, ui: &mut Ui) {
                     format!("{:5.1}", e.peak_cpu),
                     format!("+{}", dur(e.peak_at)),
                     bytes(e.peak_mem as f64),
+                    format!("{:5.1}", p.avg_gpu(e)),
+                    format!("{:5.1}", e.peak_gpu),
+                    bytes(e.peak_gpu_mem as f64),
                     bytes(e.io_bytes),
                     if p.has_net {
                         bytes(e.net_rx)
@@ -386,6 +425,9 @@ fn profile(app: &mut App, ui: &mut Ui) {
                     Some(e.peak_cpu as f64),
                     Some(e.peak_at),
                     Some(e.peak_mem as f64),
+                    Some(p.avg_gpu(e)),
+                    Some(e.peak_gpu as f64),
+                    Some(e.peak_gpu_mem as f64),
                     Some(e.io_bytes),
                     Some(e.net_rx),
                     Some(e.net_tx),
@@ -402,6 +444,9 @@ fn profile(app: &mut App, ui: &mut Ui) {
         ("peak%", 60.0),
         ("peak at", 80.0),
         ("peak mem", 84.0),
+        ("avg gpu%", 72.0),
+        ("peak gpu", 72.0),
+        ("peak gpu mem", 96.0),
         ("total i/o", 90.0),
         ("net ▼", 90.0),
         ("net ▲", 0.0),
@@ -497,7 +542,7 @@ fn details_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
         let h = &app.hist;
         let mem_growth = (h.sel_mem.samples.len() >= 20)
             .then(|| h.sel_mem.samples.back().unwrap().1 - h.sel_mem.samples.front().unwrap().1);
-        let findings = crate::inspect::findings(&i, p.cpu, p.threads, mem_growth, p.net);
+        let findings = crate::inspect::findings(&i, p.cpu, p.threads, mem_growth, p.net, p.gpu);
         let mut close = false;
 
         ui.columns(4, |c| {
@@ -565,6 +610,14 @@ fn details_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                     ("cpu", format!("{:.1}% of machine", p.cpu)),
                     ("  user", opt(i.user_pct.map(|v| format!("{v:.1}%")))),
                     ("  kernel", opt(i.kernel_pct.map(|v| format!("{v:.1}%")))),
+                    (
+                        "gpu",
+                        if s.gpu_err.is_some() {
+                            na()
+                        } else {
+                            format!("{:.1}% · mem {}", p.gpu, bytes(p.gpu_mem as f64))
+                        },
+                    ),
                     ("threads", opt(p.threads.map(|t| t.to_string()))),
                     ("handles", opt(i.raw.handles.map(|t| t.to_string()))),
                     (
@@ -588,7 +641,7 @@ fn details_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
 
             // activity graphs
             section(&mut c[2], "last 60 s");
-            let gh = ((c[2].available_height() - 4.0 * 16.0) / 4.0).max(16.0);
+            let gh = ((c[2].available_height() - 5.0 * 16.0) / 5.0).max(16.0);
             let w = c[2].available_width();
             // cpu coloured by load; the others auto-scale, so a fixed colour avoids false "red"
             let net_now = p.net.map_or(na(), |(a, b)| rate(a + b));
@@ -599,6 +652,13 @@ fn details_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                     hmax(&h.sel_cpu).max(5.0),
                     format!("{:.1}%", p.cpu),
                     None,
+                ),
+                (
+                    "gpu%",
+                    &h.sel_gpu,
+                    hmax(&h.sel_gpu).max(5.0),
+                    format!("{:.1}%", p.gpu),
+                    Some(C_GPU),
                 ),
                 (
                     "mem",
