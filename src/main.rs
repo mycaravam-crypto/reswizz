@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod etw;
+mod gpu;
 mod history;
 mod inspect;
 mod net;
@@ -33,6 +34,10 @@ pub struct Proc {
     /// Network (sent, received) bytes/s from ETW; `None` when tracing is unavailable.
     pub net: Option<(f64, f64)>,
     pub threads: Option<u32>,
+    /// GPU % of the process's busiest engine (0 when counters are unavailable).
+    pub gpu: f32,
+    /// GPU memory (dedicated + shared), bytes.
+    pub gpu_mem: u64,
     pub start: u64,
     pub status: String,
     pub exe: Option<String>,
@@ -53,6 +58,11 @@ pub struct Snapshot {
     pub net_rx: f64,
     pub net_tx: f64,
     pub adapters: Vec<(String, f64, f64)>,
+    /// Busiest GPU engine, %.
+    pub gpu: f32,
+    pub gpu_mem: u64,
+    /// Why GPU counters are unavailable, if they are.
+    pub gpu_err: Option<String>,
     pub procs: Vec<Proc>,
     pub endpoints: Result<Vec<net::Endpoint>, String>,
     /// Why per-process network is unavailable, if it is.
@@ -90,6 +100,10 @@ fn spawn_sampler(
             .with_exe(UpdateKind::OnlyIfNotSet)
             .with_cmd(UpdateKind::OnlyIfNotSet);
         let net_trace_err = etw::start().err();
+        let (mut gpu, gpu_err) = match gpu::Gpu::new() {
+            Ok(g) => (Some(g), None),
+            Err(e) => (None, Some(e)),
+        };
         let mut prev_raw: Option<(u32, inspect::Raw)> = None;
         sys.refresh_cpu_usage();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
@@ -107,6 +121,7 @@ fn spawn_sampler(
             let cores = sys.cpus().len();
             let net = etw::take();
             let threads = inspect::thread_counts();
+            let g = gpu.as_mut().map(|g| g.sample()).unwrap_or_default();
             let procs = sys
                 .processes()
                 .values()
@@ -118,6 +133,7 @@ fn spawn_sampler(
                         .map(|s| s.to_string_lossy())
                         .collect::<Vec<_>>();
                     let pid = p.pid().as_u32();
+                    let (gpu, gpu_mem) = g.procs.get(&pid).copied().unwrap_or_default();
                     Proc {
                         pid,
                         net: net_trace_err.is_none().then(|| {
@@ -125,6 +141,8 @@ fn spawn_sampler(
                             (tx as f64 / secs, rx as f64 / secs)
                         }),
                         threads: threads.get(&pid).copied(),
+                        gpu,
+                        gpu_mem,
                         ppid: p.parent().map(|x| x.as_u32()),
                         name: p.name().to_string_lossy().into_owned(),
                         cpu: normalize_cpu(p.cpu_usage(), cores),
@@ -163,6 +181,9 @@ fn spawn_sampler(
                 net_rx: adapters.iter().map(|a| a.1).sum(),
                 net_tx: adapters.iter().map(|a| a.2).sum(),
                 adapters,
+                gpu: g.util,
+                gpu_mem: g.mem,
+                gpu_err: gpu_err.clone(),
                 procs,
                 endpoints: net::endpoints(),
                 net_trace_err: net_trace_err.clone(),
@@ -201,11 +222,13 @@ pub struct Histories {
     pub disk_w: History,
     pub net_rx: History,
     pub net_tx: History,
+    pub gpu: History,
     /// Selected process (cleared when the selection changes).
     pub sel_cpu: History,
     pub sel_mem: History,
     pub sel_io: History,
     pub sel_net: History,
+    pub sel_gpu: History,
 }
 
 pub struct App {
@@ -246,10 +269,12 @@ impl App {
                 disk_w: History::new(cap),
                 net_rx: History::new(cap),
                 net_tx: History::new(cap),
+                gpu: History::new(cap),
                 sel_cpu: History::new(cap),
                 sel_mem: History::new(cap),
                 sel_io: History::new(cap),
                 sel_net: History::new(cap),
+                sel_gpu: History::new(cap),
             },
             profile: Profile::default(),
             view: View::Profile,
@@ -268,6 +293,7 @@ impl App {
                 &mut h.sel_mem,
                 &mut h.sel_io,
                 &mut h.sel_net,
+                &mut h.sel_gpu,
             ] {
                 x.samples.clear();
             }
@@ -290,18 +316,29 @@ impl eframe::App for App {
             h.disk_w.push(t, s.disk_write);
             h.net_rx.push(t, s.net_rx);
             h.net_tx.push(t, s.net_tx);
+            h.gpu.push(t, s.gpu as f64);
             if let Some(p) = self.selected.and_then(|id| find(&s.procs, id)) {
                 h.sel_cpu.push(t, p.cpu as f64);
                 h.sel_mem.push(t, p.mem as f64);
                 h.sel_io.push(t, p.io);
                 h.sel_net.push(t, p.net.map_or(0.0, |(a, b)| a + b));
+                h.sel_gpu.push(t, p.gpu as f64);
             }
             self.profile.record(
                 s.secs,
                 s.cores.len(),
-                s.procs
-                    .iter()
-                    .map(|p| (p.name.as_str(), p.pid, p.cpu, p.mem, p.io, p.net)),
+                s.procs.iter().map(|p| {
+                    (
+                        p.name.as_str(),
+                        p.pid,
+                        p.cpu,
+                        p.mem,
+                        p.io,
+                        p.net,
+                        p.gpu,
+                        p.gpu_mem,
+                    )
+                }),
             );
             self.snap = Some(s);
         }
@@ -342,6 +379,8 @@ mod tests {
             start,
             net: None,
             threads: None,
+            gpu: 0.0,
+            gpu_mem: 0,
             status: String::new(),
             exe: None,
             cmd: None,
