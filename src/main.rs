@@ -319,6 +319,7 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_title(concat!("reswizz ", env!("CARGO_PKG_VERSION")))
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0]),
         ..Default::default()

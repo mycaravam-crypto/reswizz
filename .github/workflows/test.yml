@@ -1,0 +1,34 @@
+# Format, lint and unit tests on every pull request and on main. Linux covers the pure logic quickly; Windows builds
+# and lints the Win32/ETW code paths that only compile there, and runs the live IP Helper test.
+name: test
+on:
+  pull_request:
+  push: { branches: [main] }
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: Check versioning policy
+        run: bash .github/scripts/semver-next.test.sh
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      # The release binary, so a PR that breaks the shipping build fails here rather than after merge.
+      - run: cargo build --release --locked

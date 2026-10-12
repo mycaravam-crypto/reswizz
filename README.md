@@ -30,6 +30,17 @@ The output is a single `reswizz.exe`. It has no runtime dependencies and makes n
     cargo test                                      # pure logic, any OS
     cargo test --target x86_64-pc-windows-gnu       # adds live IP Helper test (Windows / WSL)
 
+## CI and releases
+
+GitHub Actions run on every pull request and on `main`:
+
+- **test**: `fmt`, `clippy -D warnings` and `cargo test` on Linux; `clippy`, `cargo test` and the release build on Windows.
+- **security**: Trivy scans `Cargo.lock` for CVEs (weekly too). A fixable CRITICAL fails the job.
+- **release**: each merged PR into `main` tags the next SemVer version and publishes a GitHub release. The release has
+  `reswizz-vX.Y.Z-windows-x64.exe` and `SHA256SUMS.txt`. Git tags are the source of truth. A PR label picks the bump:
+  `release:patch` (the default), `release:minor`, `release:major`, or `release:none` to skip the release.
+  The version shows in the window title.
+
 ## Known limitations
 
 - **Per-process CPU** is a percentage of the whole machine: all logical cores together equal 100%.
