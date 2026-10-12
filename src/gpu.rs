@@ -61,7 +61,7 @@ impl Gpu {
 pub use imp::Gpu;
 
 #[cfg(windows)]
-mod imp {
+pub(crate) mod imp {
     use super::*;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::System::Performance::*;
@@ -77,7 +77,7 @@ mod imp {
     // The query is only ever touched from the sampler thread that owns it.
     unsafe impl Send for Gpu {}
 
-    fn wide(s: &str) -> Vec<u16> {
+    pub(crate) fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
     }
 
@@ -151,7 +151,10 @@ mod imp {
     }
 
     /// All valid (instance name, value) pairs of a wildcard counter.
-    fn read(counter: PDH_HCOUNTER, fmt: PDH_FMT) -> Vec<(String, PDH_FMT_COUNTERVALUE_0)> {
+    pub(crate) fn read(
+        counter: PDH_HCOUNTER,
+        fmt: PDH_FMT,
+    ) -> Vec<(String, PDH_FMT_COUNTERVALUE_0)> {
         unsafe {
             let (mut size, mut count) = (0u32, 0u32);
             if PdhGetFormattedCounterArrayW(counter, fmt, &mut size, &mut count, null_mut())

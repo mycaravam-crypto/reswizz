@@ -6,6 +6,7 @@ mod history;
 mod inspect;
 mod net;
 mod profile;
+mod throttle;
 mod ui;
 
 use std::sync::Arc;
@@ -49,6 +50,10 @@ pub struct Snapshot {
     pub secs: f64,
     pub cpu: f32,
     pub cores: Vec<f32>,
+    /// Actual CPU speed, % of base (>100 = turbo); `None` when the counter is unavailable.
+    pub cpu_speed: Option<f32>,
+    /// Why the CPU is held back (heat / power), if it is.
+    pub throttle: Option<String>,
     pub mem_used: u64,
     pub mem_total: u64,
     pub swap_used: u64,
@@ -104,6 +109,7 @@ fn spawn_sampler(
             Ok(g) => (Some(g), None),
             Err(e) => (None, Some(e)),
         };
+        let mut throttle = throttle::Throttle::new().ok();
         let mut prev_raw: Option<(u32, inspect::Raw)> = None;
         sys.refresh_cpu_usage();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
@@ -121,6 +127,8 @@ fn spawn_sampler(
             let cores = sys.cpus().len();
             let net = etw::take();
             let threads = inspect::thread_counts();
+            let cpu = sys.global_cpu_usage();
+            let th = throttle.as_mut().map(|t| t.sample(cpu)).unwrap_or_default();
             let g = gpu.as_mut().map(|g| g.sample()).unwrap_or_default();
             let procs = sys
                 .processes()
@@ -170,7 +178,9 @@ fn spawn_sampler(
                 .collect();
             let snap = Snapshot {
                 secs,
-                cpu: sys.global_cpu_usage(),
+                cpu,
+                cpu_speed: th.speed,
+                throttle: th.reason,
                 cores: sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
                 mem_used: sys.used_memory(),
                 mem_total: sys.total_memory(),

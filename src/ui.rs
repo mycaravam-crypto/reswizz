@@ -99,6 +99,17 @@ fn cpu_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                     .strong(),
             );
             ui.label(RichText::new(format!("{} threads", s.cores.len())).color(MUTED));
+            if let Some(v) = s.cpu_speed {
+                let hover = "actual speed vs base clock (>100% = turbo)";
+                match &s.throttle {
+                    Some(why) => ui
+                        .label(RichText::new(format!("{v:.0}% speed · throttled")).color(HIGH))
+                        .on_hover_text(format!("{why}\n{hover}")),
+                    None => ui
+                        .label(RichText::new(format!("{v:.0}% speed")).color(MUTED))
+                        .on_hover_text(hover),
+                };
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut ms = app.interval_ms.load(std::sync::atomic::Ordering::Relaxed);
                 ui.add(egui::Slider::new(&mut ms, MIN_INTERVAL_MS..=MAX_INTERVAL_MS).suffix("ms"));
