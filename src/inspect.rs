@@ -19,6 +19,16 @@ pub struct Raw {
     pub io: Option<[u64; 6]>,
 }
 
+/// Authenticode result for the exe (embedded or catalog signature).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Sig {
+    /// Valid; the signer's display name.
+    Signed(String),
+    Unsigned,
+    /// Signature present but not trusted; why.
+    Bad(String),
+}
+
 /// Raw values plus per-second rates against the previous sample of the same process.
 #[derive(Default, Clone)]
 pub struct Inspect {
@@ -30,6 +40,8 @@ pub struct Inspect {
     /// read/write/other: ops/s then bytes/s.
     pub io_s: Option<[f64; 6]>,
     pub services: Vec<String>,
+    /// `None` = not checked (no exe path or file unreadable).
+    pub sig: Option<Sig>,
 }
 
 pub fn derive(
@@ -57,7 +69,67 @@ pub fn derive(
             .map(|(a, b)| std::array::from_fn(|i| per_s(a[i], b[i]))),
         raw,
         services,
+        sig: None,
     }
+}
+
+/// Folder part of a Windows exe path.
+pub fn dir_of(exe: &str) -> &str {
+    exe.rsplit_once(['\\', '/']).map_or("", |x| x.0)
+}
+
+/// Windows binaries that malware likes to name itself after, with their real home.
+const SYSTEM_NAMES: &[(&str, &str)] = &[
+    ("svchost.exe", "\\windows\\system32"),
+    ("lsass.exe", "\\windows\\system32"),
+    ("csrss.exe", "\\windows\\system32"),
+    ("smss.exe", "\\windows\\system32"),
+    ("services.exe", "\\windows\\system32"),
+    ("wininit.exe", "\\windows\\system32"),
+    ("winlogon.exe", "\\windows\\system32"),
+    ("spoolsv.exe", "\\windows\\system32"),
+    ("taskhostw.exe", "\\windows\\system32"),
+    ("dllhost.exe", "\\windows\\system32"),
+    ("conhost.exe", "\\windows\\system32"),
+    ("rundll32.exe", "\\windows\\system32"),
+    ("explorer.exe", "\\windows"),
+];
+
+/// Hints about where the executable lives; `on_disk` = the exe file still exists.
+// ponytail: path heuristics only; add Authenticode (WinVerifyTrust) if these are not enough.
+pub fn location_findings(exe: &str, on_disk: bool) -> Vec<String> {
+    let mut f = Vec::new();
+    let low = exe.to_lowercase();
+    let (dir, name) = low.rsplit_once(['\\', '/']).unwrap_or(("", &low));
+    if !on_disk {
+        f.push("the exe file is gone from disk: deleted or replaced after start".into());
+    }
+    if let Some((_, home)) = SYSTEM_NAMES.iter().find(|(n, _)| *n == name) {
+        let ok = dir.ends_with(home)
+            || (home.ends_with("system32") && dir.ends_with("\\windows\\syswow64"));
+        if !ok {
+            f.push(format!(
+                "named like a Windows system file ({name}) but not in its usual folder: suspicious"
+            ));
+        }
+    }
+    let where_ = if low.contains("\\temp\\") || low.contains("\\tmp\\") {
+        Some("a temp folder: installers do this, malware too")
+    } else if low.contains("\\downloads\\") {
+        Some("Downloads: something you started by hand")
+    } else if low.contains("\\users\\public\\") || low.contains("\\$recycle.bin\\") {
+        Some("a shared/odd folder (Public, Recycle Bin): rarely legitimate")
+    } else if low.contains("\\appdata\\") {
+        Some(
+            "user AppData: normal for per-user apps (Teams, Discord, updaters), check it if you don't know it",
+        )
+    } else {
+        None
+    };
+    if let Some(w) = where_ {
+        f.push(format!("runs from {w}"));
+    }
+    f
 }
 
 /// Plain-language hints. Thresholds are rules of thumb, not science.
@@ -144,6 +216,15 @@ pub fn findings(
             "keeping a GPU engine {gpu:.0}% busy: rendering, video encode/decode or GPU compute"
         ));
     }
+    match &i.sig {
+        Some(Sig::Unsigned) => f.push(
+            "exe has no digital signature: fine for small tools and your own builds, rare for system or big-vendor software".into(),
+        ),
+        Some(Sig::Bad(why)) => f.push(format!(
+            "signature is INVALID ({why}): suspicious, the file may have been tampered with"
+        )),
+        _ => {}
+    }
     if !i.services.is_empty() {
         f.push(format!(
             "hosts services: {} — the load comes from one of these",
@@ -169,16 +250,21 @@ pub fn services(_pid: u32) -> Vec<String> {
 }
 
 #[cfg(not(windows))]
+pub fn signature(_exe: &str) -> Option<Sig> {
+    None
+}
+
+#[cfg(not(windows))]
 pub fn relaunch_as_admin() -> bool {
     false
 }
 
 #[cfg(windows)]
-pub use imp::{raw, relaunch_as_admin, services, thread_counts};
+pub use imp::{raw, relaunch_as_admin, services, signature, thread_counts};
 
 #[cfg(windows)]
 mod imp {
-    use super::Raw;
+    use super::{Raw, Sig};
     use std::collections::HashMap;
     use std::mem::{size_of, zeroed};
     use std::ptr::{null, null_mut};
@@ -319,6 +405,178 @@ mod imp {
         }
     }
 
+    /// Checks the embedded Authenticode signature, then the system catalogs (most of
+    /// System32 is catalog-signed). Revocation is not checked online: no network calls.
+    pub fn signature(exe: &str) -> Option<Sig> {
+        use windows_sys::Win32::Foundation::*;
+        use windows_sys::Win32::Security::Cryptography::Catalog::*;
+        use windows_sys::Win32::Security::Cryptography::{
+            BCRYPT_SHA1_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
+        };
+        use windows_sys::Win32::Security::WinTrust::*;
+        use windows_sys::Win32::Storage::FileSystem::*;
+
+        let path: Vec<u16> = exe.encode_utf16().chain([0]).collect();
+        let mut file = WINTRUST_FILE_INFO {
+            cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+            pcwszFilePath: path.as_ptr(),
+            ..Default::default()
+        };
+        let (r, signer) = verify(WTD_CHOICE_FILE, WINTRUST_DATA_0 { pFile: &mut file });
+        if !matches!(r, TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN) {
+            return sig(r, signer);
+        }
+        // SAFETY: handles checked and released; buffers outlive every call that reads them.
+        unsafe {
+            let h = CreateFileW(
+                path.as_ptr(),
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if h == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut out = Some(Sig::Unsigned);
+            for alg in [BCRYPT_SHA256_ALGORITHM, BCRYPT_SHA1_ALGORITHM] {
+                let mut admin = 0isize;
+                if CryptCATAdminAcquireContext2(&mut admin, null(), alg, null(), 0) == 0 {
+                    continue;
+                }
+                let (mut hash, mut n) = ([0u8; 64], 64u32);
+                let cat =
+                    if CryptCATAdminCalcHashFromFileHandle2(admin, h, &mut n, hash.as_mut_ptr(), 0)
+                        != 0
+                    {
+                        CryptCATAdminEnumCatalogFromHash(admin, hash.as_ptr(), n, 0, null_mut())
+                    } else {
+                        0
+                    };
+                let mut info = CATALOG_INFO {
+                    cbStruct: size_of::<CATALOG_INFO>() as u32,
+                    ..Default::default()
+                };
+                if cat != 0 && CryptCATCatalogInfoFromContext(cat, &mut info, 0) != 0 {
+                    let tag: Vec<u16> = hash[..n as usize]
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<String>()
+                        .encode_utf16()
+                        .chain([0])
+                        .collect();
+                    let mut c = WINTRUST_CATALOG_INFO {
+                        cbStruct: size_of::<WINTRUST_CATALOG_INFO>() as u32,
+                        pcwszCatalogFilePath: info.wszCatalogFile.as_ptr(),
+                        pcwszMemberTag: tag.as_ptr(),
+                        pcwszMemberFilePath: path.as_ptr(),
+                        hMemberFile: h,
+                        pbCalculatedFileHash: hash.as_mut_ptr(),
+                        cbCalculatedFileHash: n,
+                        hCatAdmin: admin,
+                        ..Default::default()
+                    };
+                    let (r, signer) =
+                        verify(WTD_CHOICE_CATALOG, WINTRUST_DATA_0 { pCatalog: &mut c });
+                    out = sig(r, signer);
+                }
+                if cat != 0 {
+                    CryptCATAdminReleaseCatalogContext(admin, cat, 0);
+                }
+                CryptCATAdminReleaseContext(admin, 0);
+                if cat != 0 {
+                    break;
+                }
+            }
+            CloseHandle(h);
+            out
+        }
+    }
+
+    /// One WinVerifyTrust round trip: (status, signer display name).
+    fn verify(
+        choice: u32,
+        what: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0,
+    ) -> (i32, Option<String>) {
+        use windows_sys::Win32::Security::Cryptography::{
+            CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW,
+        };
+        use windows_sys::Win32::Security::WinTrust::*;
+        let mut d = WINTRUST_DATA {
+            cbStruct: size_of::<WINTRUST_DATA>() as u32,
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOKE_NONE,
+            dwUnionChoice: choice,
+            Anonymous: what,
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+            ..Default::default()
+        };
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        // SAFETY: `d` and what it points to outlive both calls; state is closed below.
+        unsafe {
+            let r = WinVerifyTrust(
+                null_mut(),
+                &mut action,
+                (&mut d as *mut WINTRUST_DATA).cast(),
+            );
+            let mut signer = None;
+            let pd = WTHelperProvDataFromStateData(d.hWVTStateData);
+            if !pd.is_null() {
+                let s = WTHelperGetProvSignerFromChain(pd, 0, 0, 0);
+                if !s.is_null() && (*s).csCertChain > 0 {
+                    let cert = (*(*s).pasCertChain).pCert;
+                    let mut buf = [0u16; 256];
+                    let n = CertGetNameStringW(
+                        cert,
+                        CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                        0,
+                        null(),
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                    );
+                    if n > 1 {
+                        signer = Some(String::from_utf16_lossy(&buf[..n as usize - 1]));
+                    }
+                }
+            }
+            d.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(
+                null_mut(),
+                &mut action,
+                (&mut d as *mut WINTRUST_DATA).cast(),
+            );
+            (r, signer)
+        }
+    }
+
+    fn sig(r: i32, signer: Option<String>) -> Option<Sig> {
+        use windows_sys::Win32::Foundation::*;
+        let why = match r {
+            0 => {
+                return Some(Sig::Signed(
+                    signer.unwrap_or_else(|| "unknown signer".into()),
+                ));
+            }
+            TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN => return Some(Sig::Unsigned),
+            // 0x8007xxxx = plain Win32 error (access denied, file locked): could not check
+            CRYPT_E_FILE_ERROR => return None,
+            _ if (r as u32) >> 16 == 0x8007 => return None,
+            TRUST_E_BAD_DIGEST => "file changed after signing".into(),
+            CERT_E_UNTRUSTEDROOT => "untrusted root, self-signed?".into(),
+            TRUST_E_EXPLICIT_DISTRUST => "certificate explicitly distrusted".into(),
+            CERT_E_REVOKED => "certificate revoked".into(),
+            CERT_E_EXPIRED => "certificate expired".into(),
+            _ => format!("error 0x{:08X}", r as u32),
+        };
+        Some(Sig::Bad(match signer {
+            Some(s) => format!("{why}, signer {s}"),
+            None => why,
+        }))
+    }
+
     /// Starts this exe again via UAC ("runas"). True if the elevated copy launched.
     pub fn relaunch_as_admin() -> bool {
         use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -377,5 +635,58 @@ mod tests {
         let f = findings(&Inspect::default(), 0.0, None, None, None, 80.0);
         assert!(f[0].contains("GPU engine 80% busy"));
         assert!(findings(&Inspect::default(), 0.0, None, None, None, 0.0).is_empty());
+        let bad = Inspect {
+            sig: Some(Sig::Bad("file changed after signing".into())),
+            ..Default::default()
+        };
+        assert!(findings(&bad, 0.0, None, None, None, 0.0)[0].contains("INVALID"));
+        let ok = Inspect {
+            sig: Some(Sig::Signed("Microsoft Windows".into())),
+            ..Default::default()
+        };
+        assert!(findings(&ok, 0.0, None, None, None, 0.0).is_empty());
+    }
+
+    #[test]
+    fn location_flags_odd_folders_and_fake_system_names() {
+        assert_eq!(
+            dir_of(r"C:\Windows\System32\svchost.exe"),
+            r"C:\Windows\System32"
+        );
+        assert!(location_findings(r"C:\Windows\System32\svchost.exe", true).is_empty());
+        assert!(location_findings(r"C:\Windows\SysWOW64\rundll32.exe", true).is_empty());
+        assert!(location_findings(r"C:\Windows\explorer.exe", true).is_empty());
+        assert!(location_findings(r"C:\Program Files\Foo\foo.exe", true).is_empty());
+        let fake = location_findings(r"C:\Users\me\AppData\Local\Temp\svchost.exe", true);
+        assert!(fake[0].contains("system file"));
+        assert!(fake[1].contains("temp"));
+        assert!(location_findings(r"C:\Users\me\Downloads\x.exe", false)[0].contains("gone"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod live {
+    use super::*;
+
+    #[test]
+    fn verifies_embedded_and_catalog_signatures() {
+        for exe in [
+            r"C:\Windows\System32\svchost.exe",
+            r"C:\Windows\System32\calc.exe",
+            r"C:\Windows\explorer.exe",
+        ] {
+            let s = signature(exe);
+            eprintln!("{exe}: {s:?}");
+            assert!(
+                matches!(s, Some(Sig::Signed(ref p)) if p.contains("Microsoft")),
+                "{exe}"
+            );
+        }
+        let dir = std::env::temp_dir().join("reswizz-sig-test.exe");
+        std::fs::write(&dir, b"MZ not a real program").unwrap();
+        let s = signature(&dir.display().to_string());
+        std::fs::remove_file(&dir).ok();
+        assert_eq!(s, Some(Sig::Unsigned));
+        assert_eq!(signature(r"C:\no\such\file.exe"), None);
     }
 }
