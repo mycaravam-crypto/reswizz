@@ -111,6 +111,8 @@ fn spawn_sampler(
         };
         let mut throttle = throttle::Throttle::new().ok();
         let mut prev_raw: Option<(u32, inspect::Raw)> = None;
+        // ponytail: keyed by path only, a file swapped in place keeps its old verdict until restart
+        let mut sigs: std::collections::HashMap<String, Option<inspect::Sig>> = Default::default();
         sys.refresh_cpu_usage();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
         let mut last = Instant::now();
@@ -202,8 +204,17 @@ fn spawn_sampler(
                     pid => {
                         let raw = inspect::raw(pid);
                         let prev = prev_raw.as_ref().filter(|p| p.0 == pid).map(|p| &p.1);
-                        let i =
+                        let mut i =
                             inspect::derive(prev, raw.clone(), secs, cores, inspect::services(pid));
+                        let exe = sys
+                            .process(sysinfo::Pid::from_u32(pid))
+                            .and_then(|p| p.exe());
+                        i.sig = exe.and_then(|e| {
+                            let e = e.display().to_string();
+                            sigs.entry(e.clone())
+                                .or_insert_with(|| inspect::signature(&e))
+                                .clone()
+                        });
                         prev_raw = Some((pid, raw));
                         Some((pid, i))
                     }

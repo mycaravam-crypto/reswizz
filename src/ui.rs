@@ -318,9 +318,9 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
             q.is_empty()
                 || p.name.to_lowercase().contains(&q)
                 || p.pid.to_string() == q
-                || p.cmd
-                    .as_deref()
-                    .is_some_and(|c| c.to_lowercase().contains(&q))
+                || [&p.cmd, &p.exe]
+                    .iter()
+                    .any(|c| c.as_deref().is_some_and(|c| c.to_lowercase().contains(&q)))
         })
         .collect();
     let rows: Vec<Row> = list
@@ -335,6 +335,10 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                 rate(p.io),
                 p.net.map_or("n/a".into(), |(tx, rx)| rate(tx + rx)),
                 p.threads.map_or("n/a".into(), |t| t.to_string()),
+                p.exe
+                    .as_deref()
+                    .map_or("n/a", crate::inspect::dir_of)
+                    .to_string(),
                 p.cmd.clone().or_else(|| p.exe.clone()).unwrap_or_default(),
             ],
             nums: vec![
@@ -346,6 +350,7 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                 Some(p.io),
                 Some(p.net.map_or(-1.0, |(tx, rx)| tx + rx)),
                 Some(p.threads.map_or(-1.0, |t| t as f64)),
+                None,
                 None,
             ],
             bar: Some(p.cpu * cores / 100.0),
@@ -363,6 +368,7 @@ fn processes(app: &mut App, ui: &mut Ui, s: &Snapshot) {
         ("i/o", 96.0),
         ("net", 96.0),
         ("thr", 44.0),
+        ("dir", 260.0),
         ("command", 0.0),
     ];
     if let Some(i) = table(
@@ -542,7 +548,22 @@ fn details_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
         let h = &app.hist;
         let mem_growth = (h.sel_mem.samples.len() >= 20)
             .then(|| h.sel_mem.samples.back().unwrap().1 - h.sel_mem.samples.front().unwrap().1);
-        let findings = crate::inspect::findings(&i, p.cpu, p.threads, mem_growth, p.net, p.gpu);
+        let mut findings = crate::inspect::findings(&i, p.cpu, p.threads, mem_growth, p.net, p.gpu);
+        // ponytail: one stat per frame for the selected exe; cache in the sampler if it ever shows up
+        let meta = p.exe.as_deref().map(|e| (e, std::fs::metadata(e).ok()));
+        if let Some((e, m)) = &meta {
+            findings.extend(crate::inspect::location_findings(e, m.is_some()));
+        }
+        let file = meta.as_ref().and_then(|(_, m)| m.as_ref()).map(|m| {
+            let changed = m
+                .modified()
+                .ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .map_or(String::new(), |d| {
+                    format!(" · changed {} ago", dur(d.as_secs_f64()))
+                });
+            format!("{}{changed}", bytes(m.len() as f64))
+        });
         let mut close = false;
 
         ui.columns(4, |c| {
@@ -592,10 +613,34 @@ fn details_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                     ("status", p.status.clone()),
                     ("priority", opt(i.raw.priority.map(str::to_string))),
                     ("started", opt(age)),
+                    (
+                        "dir",
+                        opt(p
+                            .exe
+                            .as_deref()
+                            .map(|e| crate::inspect::dir_of(e).to_string())),
+                    ),
                     ("exe", opt(p.exe.clone())),
+                    ("file", opt(file)),
+                    (
+                        "signed",
+                        match &i.sig {
+                            Some(crate::inspect::Sig::Signed(s)) => s.clone(),
+                            Some(crate::inspect::Sig::Unsigned) => "NO, unsigned".into(),
+                            Some(crate::inspect::Sig::Bad(why)) => format!("INVALID: {why}"),
+                            None => na(),
+                        },
+                    ),
                     ("cmd", opt(p.cmd.clone())),
                 ],
             );
+            if let Some(exe) = &p.exe
+                && c[0].small_button("open folder").clicked()
+            {
+                let _ = std::process::Command::new("explorer")
+                    .arg(format!("/select,{exe}"))
+                    .spawn();
+            }
 
             // resources
             section(&mut c[1], "resources");
