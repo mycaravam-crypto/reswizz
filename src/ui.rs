@@ -90,6 +90,12 @@ pub fn page(app: &mut App, ui: &mut Ui) {
 
 // ---------- boxes ----------
 
+/// °C, colored from cool (40) to hot (95).
+// ponytail: one 40–95 °C scale for CPU and GPU; split if a part runs hot by design.
+fn temp_label(ui: &mut Ui, t: f32) -> egui::Response {
+    ui.label(RichText::new(format!("{t:.0}°C")).color(heat((t - 40.0) / 55.0)))
+}
+
 fn cpu_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
     boxed(ui, "cpu", C_CPU, |ui| {
         ui.horizontal(|ui| {
@@ -109,6 +115,10 @@ fn cpu_box(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                         .label(RichText::new(format!("{v:.0}% speed")).color(MUTED))
                         .on_hover_text(hover),
                 };
+            }
+            if let Some(t) = s.cpu_temp {
+                temp_label(ui, t)
+                    .on_hover_text("hottest ACPI thermal zone; may differ from the CPU die sensor");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut ms = app.interval_ms.load(std::sync::atomic::Ordering::Relaxed);
@@ -197,6 +207,13 @@ fn side_column(app: &mut App, ui: &mut Ui, s: &Snapshot) {
                 )
                 .on_hover_text("busiest GPU engine (3D, copy, video…), like Task Manager");
                 ui.label(RichText::new(format!("mem {}", bytes(s.gpu_mem as f64))).color(MUTED));
+                if let Some(t) = s.gpu_temp {
+                    temp_label(ui, t);
+                }
+                if let Some(f) = s.gpu_fan {
+                    ui.label(RichText::new(format!("fan {f} rpm")).color(MUTED))
+                        .on_hover_text("0 rpm = fan stopped (zero-RPM idle)");
+                }
             });
             let sz = ui.available_size();
             graph(ui, &app.hist.gpu, 100.0, sz, None);

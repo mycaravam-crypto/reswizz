@@ -54,6 +54,8 @@ pub struct Snapshot {
     pub cpu_speed: Option<f32>,
     /// Why the CPU is held back (heat / power), if it is.
     pub throttle: Option<String>,
+    /// Hottest thermal zone, °C.
+    pub cpu_temp: Option<f32>,
     pub mem_used: u64,
     pub mem_total: u64,
     pub swap_used: u64,
@@ -66,6 +68,8 @@ pub struct Snapshot {
     /// Busiest GPU engine, %.
     pub gpu: f32,
     pub gpu_mem: u64,
+    pub gpu_temp: Option<f32>,
+    pub gpu_fan: Option<u32>,
     /// Why GPU counters are unavailable, if they are.
     pub gpu_err: Option<String>,
     pub procs: Vec<Proc>,
@@ -183,6 +187,7 @@ fn spawn_sampler(
                 cpu,
                 cpu_speed: th.speed,
                 throttle: th.reason,
+                cpu_temp: th.temp,
                 cores: sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
                 mem_used: sys.used_memory(),
                 mem_total: sys.total_memory(),
@@ -195,6 +200,8 @@ fn spawn_sampler(
                 adapters,
                 gpu: g.util,
                 gpu_mem: g.mem,
+                gpu_temp: g.temp,
+                gpu_fan: g.fan,
                 gpu_err: gpu_err.clone(),
                 procs,
                 endpoints: net::endpoints(),

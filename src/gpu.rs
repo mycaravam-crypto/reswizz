@@ -14,6 +14,18 @@ pub struct Sample {
     pub mem: u64,
     /// pid -> (util % of its busiest engine, gpu memory bytes).
     pub procs: HashMap<u32, (f32, u64)>,
+    /// Hottest adapter, °C, if the driver reports it.
+    pub temp: Option<f32>,
+    /// Fastest fan, RPM, on adapters whose driver reports fans (0 = stopped, zero-RPM idle).
+    pub fan: Option<u32>,
+}
+
+/// Per adapter (temperature in deci-°C, fan RPM, driver reports fans) -> (hottest °C, fastest RPM).
+/// Temperature 0 means "not reported"; a fan reading only counts when the driver has fans.
+fn sensors(readings: &[(u32, u32, bool)]) -> (Option<f32>, Option<u32>) {
+    let temp = readings.iter().map(|r| r.0).filter(|&t| t > 0).max();
+    let fan = readings.iter().filter(|r| r.2).map(|r| r.1).max();
+    (temp.map(|t| t as f32 / 10.0), fan)
 }
 
 /// "pid_1234_luid_0x0_0x1_phys_0_eng_3_engtype_3D" -> (1234, "luid_0x0_0x1_phys_0_eng_3").
@@ -64,6 +76,7 @@ pub use imp::Gpu;
 pub(crate) mod imp {
     use super::*;
     use std::ptr::{null, null_mut};
+    use windows_sys::Wdk::Graphics::Direct3D::*;
     use windows_sys::Win32::System::Performance::*;
 
     pub struct Gpu {
@@ -72,6 +85,8 @@ pub(crate) mod imp {
         /// Dedicated + shared: integrated GPUs (Intel Iris etc.) only use shared memory.
         proc_mem: [PDH_HCOUNTER; 2],
         adapter_mem: [PDH_HCOUNTER; 2],
+        /// D3DKMT adapter handles + whether the driver reports fans: temps and fan RPM.
+        adapters: Vec<(u32, bool)>,
     }
 
     // The query is only ever touched from the sampler thread that owns it.
@@ -107,6 +122,7 @@ pub(crate) mod imp {
                             add(r"\GPU Adapter Memory(*)\Dedicated Usage")?,
                             add(r"\GPU Adapter Memory(*)\Shared Usage")?,
                         ],
+                        adapters: open_adapters(),
                     })
                 })();
                 if g.is_err() {
@@ -140,13 +156,67 @@ pub(crate) mod imp {
                 .flat_map(|&c| read(c, PDH_FMT_LARGE))
                 .map(|(_, v)| unsafe { v.largeValue }.max(0) as u64)
                 .sum();
-            Sample { util, mem, procs }
+            let readings: Vec<_> = self
+                .adapters
+                .iter()
+                .filter_map(|&(h, has_fan)| {
+                    let d: D3DKMT_ADAPTER_PERFDATA = query(h, KMTQAITYPE_ADAPTERPERFDATA)?;
+                    Some((d.Temperature, d.FanRPM, has_fan))
+                })
+                .collect();
+            let (temp, fan) = sensors(&readings);
+            Sample {
+                util,
+                mem,
+                procs,
+                temp,
+                fan,
+            }
         }
     }
 
     impl Drop for Gpu {
         fn drop(&mut self) {
             unsafe { PdhCloseQuery(self.query) };
+            for &(h, _) in &self.adapters {
+                unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: h }) };
+            }
+        }
+    }
+
+    /// One adapter-info struct; `PhysicalAdapterIndex` (first field) stays 0 = first GPU of the adapter.
+    fn query<T: Default>(h: u32, ty: KMTQUERYADAPTERINFOTYPE) -> Option<T> {
+        let mut out = T::default();
+        let mut q = D3DKMT_QUERYADAPTERINFO {
+            hAdapter: h,
+            Type: ty,
+            pPrivateDriverData: &mut out as *mut T as *mut _,
+            PrivateDriverDataSize: size_of::<T>() as u32,
+        };
+        (unsafe { D3DKMTQueryAdapterInfo(&mut q) } == 0).then_some(out)
+    }
+
+    /// Every WDDM adapter (render-only, display, software), with fan capability. Empty on failure.
+    fn open_adapters() -> Vec<(u32, bool)> {
+        unsafe {
+            let mut e = D3DKMT_ENUMADAPTERS2::default();
+            if D3DKMTEnumAdapters2(&mut e) != 0 {
+                return Vec::new();
+            }
+            let mut infos = vec![std::mem::zeroed::<D3DKMT_ADAPTERINFO>(); e.NumAdapters as usize];
+            e.pAdapters = infos.as_mut_ptr();
+            if D3DKMTEnumAdapters2(&mut e) != 0 {
+                return Vec::new();
+            }
+            infos.truncate(e.NumAdapters as usize);
+            infos
+                .iter()
+                .map(|a| {
+                    let caps: Option<D3DKMT_ADAPTER_PERFDATACAPS> =
+                        query(a.hAdapter, KMTQAITYPE_ADAPTERPERFDATA_CAPS);
+                    (a.hAdapter, caps.is_some_and(|c| c.MaxFanRPM > 0))
+                })
+                .collect()
         }
     }
 
@@ -204,6 +274,17 @@ mod tests {
     }
 
     #[test]
+    fn sensors_skip_unreported_values() {
+        assert_eq!(sensors(&[]), (None, None));
+        // iGPU without sensors + dGPU at 61.5 °C, fan stopped (zero-RPM idle) still counts.
+        assert_eq!(
+            sensors(&[(0, 0, false), (615, 0, true)]),
+            (Some(61.5), Some(0))
+        );
+        assert_eq!(sensors(&[(400, 900, false)]), (Some(40.0), None));
+    }
+
+    #[test]
     fn engine_load_sums_processes_gpu_is_busiest_engine() {
         let (total, pids) = engines(
             [
@@ -226,7 +307,9 @@ mod tests {
         let Ok(mut g) = Gpu::new() else { return };
         std::thread::sleep(std::time::Duration::from_millis(300));
         let s = g.sample();
+        eprintln!("gpu temp {:?} fan {:?}", s.temp, s.fan);
         assert!((0.0..=100.0).contains(&s.util));
+        assert!(s.temp.is_none_or(|t| (10.0..130.0).contains(&t)));
         if !s.procs.is_empty() {
             assert!(s.mem > 0, "processes on the GPU hold gpu memory");
         }

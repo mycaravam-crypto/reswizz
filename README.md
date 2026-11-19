@@ -54,6 +54,8 @@ GitHub Actions run on every pull request and on `main`:
 - **Thread count is not shown**, because `sysinfo` does not report it on Windows.
 - **GPU %** is the busiest engine (3D, copy, video…), as in Task Manager. **GPU memory** is dedicated plus shared,
   so integrated GPUs show real numbers. It comes from Windows performance counters and needs no admin rights.
-- **There is no fan speed.** Windows does not expose fan RPM on most machines without a kernel driver. Instead, the
-  cpu box shows actual CPU speed as % of base and flags **throttled** when a thermal zone limits the CPU, or when
-  speed drops under heavy load.
+- **Fan speed is GPU only.** Windows does not expose CPU/case fan RPM without a kernel driver. The gpu box shows
+  temperature and fan RPM when the graphics driver reports them (the same source as Task Manager). The cpu box shows
+  the hottest ACPI thermal zone, which is often a motherboard sensor rather than the CPU die and is missing on many
+  desktops. It also shows actual CPU speed as % of base and flags **throttled** when a thermal zone limits the CPU,
+  or when speed drops under heavy load.
