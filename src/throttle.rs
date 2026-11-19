@@ -10,6 +10,8 @@ pub struct Sample {
     pub speed: Option<f32>,
     /// Why the CPU is held back, if it is.
     pub reason: Option<String>,
+    /// Hottest ACPI thermal zone, °C (often near CPU package temp; absent on many desktops).
+    pub temp: Option<f32>,
 }
 
 /// `passive`: lowest thermal-zone passive limit % (100 = none); `reasons`: OR of throttle bits.
@@ -55,6 +57,7 @@ mod imp {
         /// Thermal zones are optional: many machines have none.
         passive: Option<PDH_HCOUNTER>,
         reasons: Option<PDH_HCOUNTER>,
+        temp: Option<PDH_HCOUNTER>,
     }
 
     // The query is only ever touched from the sampler thread that owns it.
@@ -81,6 +84,7 @@ mod imp {
                     perf,
                     passive: add(r"\Thermal Zone Information(*)\% Passive Limit"),
                     reasons: add(r"\Thermal Zone Information(*)\Throttle Reasons"),
+                    temp: add(r"\Thermal Zone Information(*)\Temperature"),
                 };
                 // Performance is a rate: prime it so the first real sample has a baseline.
                 PdhCollectQueryData(query);
@@ -103,9 +107,17 @@ mod imp {
                 .iter()
                 .map(|(_, v)| unsafe { v.largeValue } as u64)
                 .reduce(|a, b| a | b);
+            // Kelvin; 0 means the zone reports nothing.
+            let temp = all(self.temp, PDH_FMT_DOUBLE)
+                .iter()
+                .map(|(_, v)| unsafe { v.doubleValue })
+                .filter(|&k| k > 0.0)
+                .reduce(f64::max)
+                .map(|k| (k - 273.15) as f32);
             Sample {
                 speed,
                 reason: speed.and_then(|s| verdict(s, cpu, passive, reasons)),
+                temp,
             }
         }
     }
@@ -147,6 +159,9 @@ mod tests {
     fn live_counters_open_and_sample() {
         let mut t = Throttle::new().expect("processor performance counter");
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(t.sample(0.0).speed.is_some_and(|s| s > 0.0));
+        let s = t.sample(0.0);
+        eprintln!("cpu temp {:?}", s.temp);
+        assert!(s.speed.is_some_and(|s| s > 0.0));
+        assert!(s.temp.is_none_or(|t| (0.0..130.0).contains(&t)));
     }
 }
